@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 8 章　寻找最佳训练配置 — Ultra-Scale Playbook 中文版</title>
+<link rel="stylesheet" href="../assets/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">Ultra-Scale Playbook 中文版<span>在 GPU 集群上训练 LLM</span></a>
+  <nav class="chapnav"><a href="ch07.html">← 第 7 章</a><span class="chapnav-current">第 8 章　寻找最佳训练配置</span><a href="ch09.html">第 9 章 →</a><a class="gh-star" href="https://github.com/ai-twinkle/ultrascale-playbook-zh-tw" target="_blank" rel="noopener" data-gh-repo="ai-twinkle/ultrascale-playbook-zh-tw"><span class="star-ico">★</span><span class="gh-label">Star</span><b class="gh-count" hidden></b></a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav id="toc" class="toc"><h2>本章目录</h2></nav></aside>
+  <main class="main">
+    <div id="lab-banner"></div>
+    <article id="content" class="prose"></article>
+    <section id="lab" class="lab" hidden>
+      <h2 class="lab-title">🧪 交互实验室</h2>
+      <div id="lab-intro"></div>
+      <div id="lab-root"></div>
+    </section>
+    <nav class="pager"><a class="prev" href="ch07.html"><span class="dir">← 上一章</span><div class="ttl">第 7 章　5D 并行速览</div></a><a class="next" href="ch09.html"><span class="dir">下一章 →</span><div class="ttl">第 9 章　深入 GPU：架构与内核</div></a></nav>
+    <footer class="pagefoot">本站是 <a href="https://github.com/ai-twinkle">Twinkle AI Community</a>（台湾）制作的<strong>非官方社区译本</strong> · 译自 Hugging Face nanotron 团队《<a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook">The Ultra-Scale Playbook</a>》· 原作基于 Apache 2.0 许可证发布，译文采用相同许可，仅供学习研究使用。</footer>
+  </main>
+</div>
+<script type="text/markdown" id="chapter-md">
+# 第 8 章　寻找最佳训练配置（Finding the Best Training Configuration）
+
+> 译自 Hugging Face nanotron 团队《The Ultra-Scale Playbook: Training LLMs on GPU Clusters》（Apache 2.0），原文为 [Hugging Face Space](https://huggingface.co/spaces/nanotron/ultrascale-playbook)。
+
+到目前为止，我们已经介绍了实践中真正用来分散并训练更大模型的所有并行化技术，也说明了它们如何组合、为何能够组合。但仍有一个核心问题：最终我们该选择哪些技术，又该如何决定具体的组合方式？
+
+前一节已经简要提到这个问题，下面给出一套可行的决策流程。需要注意的是，最终配置仍要通过实际实验确定，因为它取决于计算集群的硬件特性、网络带宽、每节点 GPU 数量和单卡内存等因素。
+
+## 步骤一：让一个训练步骤能够装入内存（Fitting a Training Step in Memory）
+
+首先，我们需要弄清楚如何将一个完整的模型实例放进我们的 GPU。这里有两种常见场景。
+
+**GPU 资源充足时 🤑**：
+
+* 对于 10B 参数以下的模型，你可以只用一种并行技术，例如在 8 张 GPU 上使用张量并行（TP），或搭配完整重计算（Full Recompute）的 ZeRO-3/DP
+* 对于 10B 到 100B 参数之间、需要超过 8 张 GPU 的模型，你有几种选择：
+  * 结合张量并行（TP=8）与流水线并行（PP）
+  * 结合张量并行（TP=8）与数据并行（ZeRO-3）
+  * 只使用 ZeRO-3（也就是纯数据并行）
+* 达到 512 张以上 GPU 的规模后，纯数据并行／ZeRO-3 的效率会因通信开销而下降，此时更适合将 DP 与张量并行或流水线并行结合
+* 到了 1024+ GPU 的规模，建议的设置是张量并行 TP=8 搭配数据并行（ZeRO-2）与流水线并行
+
+> 📝 **注**：这一步只关注如何容纳单个模型实例。虽然可以借助 DP（通过 ZeRO）实现这一目标，但这里主要考虑 ZeRO-3 对模型参数内存的节省。
+
+特殊考虑：
+
+* 对于非常长的序列，你可能会想跨节点加上上下文并行（CP）。
+* 对于混合专家（Mixture of Experts）架构，跨节点使用专家并行（EP）会很有优势。
+
+**GPU 资源有限时 😭**：
+
+* 你可以启用完整的激活值重计算（full activation recomputation），用一些计算量换取内存（训练会稍微变慢）。
+* 你可以增加梯度累积（gradient accumulation）步数，在有限的内存下处理更大的批量。
+
+现在我们已经有第一个能训练起来的模型实例了，接下来要确保批量大小设置正确。
+
+## 步骤二：达到目标全局批量大小（Achieving Target Global Batch Size）
+
+完成步骤一后，微批量大小（micro batch size）和 DP 规模可能使当前批量过大或过小，因此还需要将其调整到目标值。
+
+要增加目前的全局批量大小（global batch size）：
+
+* 我们可以扩大数据并行的规模，或增加梯度累积步数
+* 对于长序列，我们可以利用上下文并行
+
+要减少目前的全局批量大小：
+
+* 可以缩减数据并行，改用其他并行化策略
+* 对于长序列，我们可以降低上下文并行的程度
+
+现在，模型已经能够以目标规模和批量运行。下一步要判断当前配置是否足够快，并尽可能提高吞吐量（throughput）。
+
+## 步骤三：优化训练吞吐量（Optimizing Training Throughput）
+
+我们希望训练跑得越快越好，让所有宝贵的 GPU 随时都被充分利用。只要内存和通信还不是瓶颈，我们可以尝试以下做法：
+
+* 扩大张量并行（利用节点内的高速带宽），直到并行度接近节点大小，以便减少其他并行化的需求
+* 在维持目标批量大小的前提下，增加使用 ZeRO-3 的数据并行
+* 当数据并行的通信开始成为瓶颈时，转而使用流水线并行
+* 分别尝试提高各个并行维度
+* 尝试多种微批量大小（$mbs$），在最大全局批量大小（GBS）、模型大小、计算与通信之间找到最佳平衡
+
+## 对数千种配置进行基准测试（Benchmarking thousands of configurations）
+
+明确以上流程后，接下来在实际环境中执行配置搜索。
+
+在 [nanotron](https://github.com/huggingface/nanotron) 仓库中，你可以找到数个脚本，用来运行我们前面讨论过的所有实验，并在真实环境中对你自己的模型与集群进行基准测试。
+
+我们对**数千种分布式配置**进行了基准测试，覆盖前文讨论的各种模型规模，以及 1 到 64 个节点、每节点 8 张 H100 的大量集群配置。这些实验构成了本书展示结果的数据基础。
+
+> 📝 **注**：这些实验几乎占满了整个科研集群，在此也向受到影响的同事们致歉。
+
+下面汇总并分析全部基准测试结果，看看实际数据如何反映不同配置的优劣。
+
+以下所有基准测试都以 4096 的序列长度、1M token 的全局批量大小进行。我们收集了每种模型与集群大小之下的所有最佳配置，并绘制成以下的热力图：
+
+![what_we_learnt_heatmap](../webapp/assets/images/what_we_learnt_heatmap.svg)
+
+*热力图展示了不同模型规模和计算节点数（每个节点有 8 张 GPU）下的最佳训练配置。配置细节包括数据并行（DP）、张量并行（TP）、流水线并行（PP）、梯度累积步数（GAS）、微批量大小（MBS）和 ZeRO 阶段。颜色表示模型 FLOPs 利用率（Model FLOPs Utilization，MFU），越亮代表效率越高。*
+
+从这张总览图中，可以归纳出几个重要结论：
+
+首先，随着节点数增加（更高的并行度），我们观察到效率下降。这个效应在较小的模型上特别明显，因为它们的计算量对模型大小的比值较低。虽然我们通常可以通过增加批量大小来弥补模型太小的问题，但我们受限于 1M 的全局批量大小上限。
+
+其次，大模型会带来另一类挑战。模型越大，内存需求增长越快；当节点较少时，模型可能完全无法装入，或者只能勉强装入并在接近 GPU 内存上限的状态下低效运行，例如在 4 个节点上训练 80B 参数模型。
+
+最后，我们的基准测试显示，性能高度取决于实现质量。当我们最初实现这两种并行化策略时，张量并行（TP）的表现优于流水线并行（PP）。在我们优化 PP 代码之后，它反而成为较快的选项。而现在我们正在改进 TP 实现中的通信重叠，预期它将重新夺回性能领先的地位。
+
+## 基准测试的经验教训（Lessons learned on benchmarking）
+
+本书不仅讨论理论和实现，也提供实际数据。为此，我们针对每种模型和多种集群规模（1 到 64 个节点、每节点 8 张 H100）测试了所有可行的分布式配置。即使排除明显不可行的组合，仍需运行数千个实验。
+
+计划本身看似简单：在集群上批量提交作业数组即可。但第一批实验提交后，各种问题很快出现：
+
+* PyTorch 进程有时无法正确清理
+* Slurm 作业管理器会强制终止作业，导致节点故障
+* 原本应该几分钟就能完成的简单基准测试，会拖成好几个小时
+* 有些工作会无限期卡住
+
+要在有限的时间内跑完所有实验，需要额外的工程投入，我们最后花了大量时间在以下事项上：
+
+* 将集群重启时间降到最低，并将闲置时间优化
+* 分析详细的 NCCL 调试日志
+* 理解内存使用模式和 CUDA 内存分配器（memory allocator）的行为
+* 改善多节点环境下的流水线并行性能
+
+这些挑战值得另文展开，但它们让我们学到了关于分布式训练基础设施复杂性的宝贵一课。理论上看似简单的事情，实践中往往需要对许多环节细致处理。
+
+在实践中重现理论结果相当有挑战性，尤其是可获得的生产级训练代码相当有限。通过 [nanotron](https://github.com/huggingface/nanotron) 与 [picotron](https://github.com/huggingface/picotron) 这样的开源项目，我们希望能让分布式训练技术变得更容易上手，也希望能在简洁、高效的代码基础上共同协作，帮助研究人员与实践工作者将硬件资源发挥到极致。
+
+---
+
+我们对 5D 并行化各种分布式方法的深度探索，到此告一段落。
+
+回过头看，前面的讨论都建立在一个关键假设上：计算与通信可以在 GPU 上高效重叠，同时不影响计算吞吐量。但现实要复杂得多。使用 NCCL send/recv 这类常见的通信原语（primitive）时，计算与通信会隐式争用资源。这是因为通信内核通常也会占用 GPU 的流式多处理器（streaming multiprocessor，SM），从而导致二者重叠时计算吞吐量下降。要进一步优化分布式训练，我们需要更深入地理解 GPU 架构本身。
+
+> 📝 **注**：此外，重叠计算与通信时的同步模式，对我们的并行策略而言不一定是最佳的。你可以在 PyTorch 团队的[这篇博客文章](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487)中找到一个例子。
+
+是时候关上灯，启动 CUDA 模式了！
+
+</script>
+<script src="../assets/marked.min.js"></script>
+<script src="../assets/katex/katex.min.js"></script>
+<script src="../assets/katex/auto-render.min.js"></script>
+<script src="../assets/widgets/ch08.js"></script>
+<script src="../assets/app.js"></script>
+<script src="../assets/gh-star.js"></script>
+</body>
+</html>

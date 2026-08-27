@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 5 章　流水线并行 — Ultra-Scale Playbook 中文版</title>
+<link rel="stylesheet" href="../assets/katex/katex.min.css">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="../index.html">Ultra-Scale Playbook 中文版<span>在 GPU 集群上训练 LLM</span></a>
+  <nav class="chapnav"><a href="ch04.html">← 第 4 章</a><span class="chapnav-current">第 5 章　流水线并行</span><a href="ch06.html">第 6 章 →</a><a class="gh-star" href="https://github.com/ai-twinkle/ultrascale-playbook-zh-tw" target="_blank" rel="noopener" data-gh-repo="ai-twinkle/ultrascale-playbook-zh-tw"><span class="star-ico">★</span><span class="gh-label">Star</span><b class="gh-count" hidden></b></a></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar"><nav id="toc" class="toc"><h2>本章目录</h2></nav></aside>
+  <main class="main">
+    <div id="lab-banner"></div>
+    <article id="content" class="prose"></article>
+    <section id="lab" class="lab" hidden>
+      <h2 class="lab-title">🧪 交互实验室</h2>
+      <div id="lab-intro"></div>
+      <div id="lab-root"></div>
+    </section>
+    <nav class="pager"><a class="prev" href="ch04.html"><span class="dir">← 上一章</span><div class="ttl">第 4 章　上下文并行</div></a><a class="next" href="ch06.html"><span class="dir">下一章 →</span><div class="ttl">第 6 章　专家并行</div></a></nav>
+    <footer class="pagefoot">本站是 <a href="https://github.com/ai-twinkle">Twinkle AI Community</a>（台湾）制作的<strong>非官方社区译本</strong> · 译自 Hugging Face nanotron 团队《<a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook">The Ultra-Scale Playbook</a>》· 原作基于 Apache 2.0 许可证发布，译文采用相同许可，仅供学习研究使用。</footer>
+  </main>
+</div>
+<script type="text/markdown" id="chapter-md">
+# 第 5 章　流水线并行（Pipeline Parallelism）
+
+> 译自 Hugging Face nanotron 团队《The Ultra-Scale Playbook: Training LLMs on GPU Clusters》（Apache 2.0），原文为 [Hugging Face Space](https://huggingface.co/spaces/nanotron/ultrascale-playbook)。
+
+> 🎧 原文此处附有由 NotebookLM 主持人讨论本书后续章节的 podcast 音频，想为阅读增添一点 podcast 气氛的读者，可前往[原网页](https://huggingface.co/spaces/nanotron/ultrascale-playbook)边读边听。
+
+在〈张量并行〉一节中，我们看到张量并行（tensor parallelism, TP）一旦扩展到单个节点之外（通常每个节点有 4 或 8 张 GPU），就必须使用带宽较低的节点间网络（inter-node connection），性能可能大幅下降。在多个节点组成的集群上（每个节点有 8 张 GPU）对 all-reduce 进行基准测试，可以清楚看到这一点：
+
+> 🔬 原文此处为交互图表（跨节点集合通信操作的带宽基准测试），可前往[原网页](https://huggingface.co/spaces/nanotron/ultrascale-playbook)体验；下图为静态版本。
+
+![跨节点通信带宽测量](../webapp/assets/images/pp_comm_bandwidth.svg)
+*跨不同节点数的节点间通信带宽测量结果，显示 AllReduce、AllGather 与 ReduceScatter 操作的中位数（实线）与第 5 至 95 百分位范围（阴影区域）。*
+
+序列并行和上下文并行有助于处理长序列，但如果内存问题来自模型本身的规模，这两种方法就无能为力了。对于 70B 参数以上的大模型，仅权重就可能超出单个节点上 4 到 8 张 GPU 的容量。此时需要引入第四个并行维度：**流水线并行**（pipeline parallelism, PP）。
+
+流水线并行的思路简单而有效：将模型的不同层分配到多张 GPU 上。例如，可以把第 1–4 层放在 GPU 1、第 5–8 层放在 GPU 2，依此类推。这样，每张 GPU 只需存储和处理模型的一部分层，从而大幅降低单卡内存需求。下面以一个 8B 模型为例，观察流水线并行对内存占用的影响：
+
+> 📝 **注**：这项技术可能会让你想起我们在 ZeRO-3 的讨论，当时我们把模型参数切分到多张 GPU 上。我们会在稍后的〈5D 并行化总览〉一节详细比较这两种技术。
+
+> 🔬 原文此处为交互图表（8B 模型在不同流水线并行度下的内存占用），可前往[原网页](https://huggingface.co/spaces/nanotron/ultrascale-playbook)体验；下图为静态版本。
+
+![8B 模型在流水线并行下的内存占用](../webapp/assets/images/pp_memoryusage.svg)
+
+观察上图会发现一个有趣的现象：虽然模型参数已经均匀切分到各张 GPU 上，但每张 GPU 的激活值（activation）内存占用并没有减少。这是因为每张 GPU 仍要处理完整批量的数据，只是负责的层不同。一张 GPU 上各层生成的激活值会传给下一张 GPU，让前向传播继续进行。
+
+这会引入一种新的通信模式：ZeRO-3 在数据并行中传输参数，而流水线并行会在 GPU 之间依次传递激活值张量。这个概念并不复杂，但要高效实现并不容易，下面展开说明。
+
+## 将模型层切分到多个节点——全前向、全后向
+
+先考虑最简单的做法：把模型层分配到多个设备，例如第一张 GPU 负责前几层，第二张 GPU 负责接下来的几层，以此类推。前向传播时，一批数据会沿模型深度方向依次经过每个计算设备。
+
+这样做的第一个直接好处是：所需的互连带宽很低，因为只需在模型深度方向上的少数位置传输中等大小的激活值。相比之下，张量并行在每一层内部都要通信多次，二者的带宽需求可能相差悬殊。
+
+问题也很明显：这种严格按顺序执行的方式很难充分利用并行计算，尤其是在前面已经讨论过计算与通信重叠之后。
+
+因此，流水线并行的主要挑战是克服 PP 的顺序依赖，让 GPU 尽量保持忙碌，避免一张 GPU 在计算时其他 GPU 只能等待。下面展示最朴素的实现中，一次前向和反向传播期间的 GPU 使用情况（图中数字代表模型层编号）：
+
+![朴素流水线并行的调度](../webapp/assets/images/pp_afab.svg)
+*流水线并行的示例：一个 16 层的模型分散在 4 张 GPU 上，数字对应层的编号。*
+
+图中灰色部分表示 GPU 的闲置时间，通常称为“气泡”（bubble）。这些气泡会直接降低整体吞吐量。
+
+我们可以通过计算因气泡而损失的时间，来量化一组流水线配置的效率。令 $t_f$ 与 $t_b$ 分别为单个微批量（micro-batch）在流水线单个阶段（stage）上测量到的前向与反向传播时间（一个常见的简化假设是 $t_b \approx 2 \times t_f$，上图便是如此）。如果能完美并行化，理想总时间会是 $t_{id}=t_f + t_b$。然而从图上可以数出来，由于流水线气泡（pipeline bubble）的存在，多出了 $t_{pb}=(p-1)*(t_f+t_b)$ 的额外时间（其中 $p$ 是流水线并行度，也就是上图中的 GPU 数量），这正是每张 GPU 在其他 GPU 计算时所空等的时间。
+
+我们可以计算额外气泡时间相对于理想时间的比例：
+
+$$
+r_{bubble} = \frac{(p-1)*(t_f+t_b)}{t_f+t_b} = p-1
+$$
+
+随着流水线阶段增多，气泡时间随之增长，GPU 使用率则不断下降。可见，朴素实现中的气泡开销可能非常显著。
+
+幸好，人们已经设计出各式各样的流水线并行方案来**缩小气泡**。
+
+第一种优化方法是把批量切成更小、几乎可以并行处理的微批量，这与前面数据并行中的做法类似。这样，当第二张 GPU 处理微批量 1 时，第一张 GPU 已经可以开始处理微批量 2。下面是使用 8 个微批量时的调度：
+
+![AFAB 调度](../webapp/assets/images/pp_afab2.svg)
+
+> 📝 **注**：先前图中的数字代表的是层编号，但从本图起，所有流水线并行示意图中的数字代表的都是微批量编号。你可以把这里的每个方格想成包含前一张图中的好几层。
+
+上面这种调度称为**全前向全后向（all-forward-all-backward, AFAB）**调度，因为我们先做完所有前向传播，然后才做所有反向传播。它的优点是前向与反向步骤大体上仍是循序的，因此保留了模型训练代码的整体结构，这使它成为最容易实现的 PP 方案之一。
+
+你可以在 Picotron 中找到 AFAB 流水线的完整实现：
+
+> 👉 [Picotron 中的 AFAB PP 实现](https://github.com/huggingface/picotron/blob/0035cce0e04afd6192763b11efe50010d8ad0f71/picotron/pipeline_parallel/pipeline_parallel.py#L54-L83)（原文此处为可展开的代码块）
+
+让我们估算这个例子中的气泡。与第一个例子的差别在于，处理 $m$ 个微批量的理想时间现在是 $t_{id} = m*(t_f+t_b)$：
+
+$$
+r_{bubble} = \frac{(p-1)*(t_f+t_b)}{m*(t_f+t_b)} = \frac{p-1}{m}
+$$
+
+可以看到，增加微批量数量能对抗流水线阶段的一部分低效率：气泡的大小会以 $m$ 为因子缩减。
+
+不过，存储所有激活值也会消耗大量内存。进入反向传播阶段之前，所有激活值都必须保留在内存中，因此这类 PP 实现的内存占用会迅速增长。
+
+为解决这个问题，可以在其余前向计算尚未结束时就开始反向传播，从而尽早释放已经使用过的激活值。
+
+## 一前一后（1F1B）与 Llama 3.1 的调度方案
+
+这种调度称为**一前一后（one-forward-one-backward, 1F1B）**，因为其中段/稳态是交替运行一次前向与一次反向传播。整体想法就是尽早开始运行反向传播。调度看起来像这样：
+
+![1F1B 调度](../webapp/assets/images/pp_1f1b.svg)
+
+如果你仔细数一数，会发现气泡的大小仍然相同，所以训练效率并没有明显改善。不过，我们现在只需要存储 $p$ 个微批量的激活值（$p$ 是流水线并行度），而不是 $m$ 个（$m$ 是微批量数量），这可以缓解我们在 AFAB 调度中遇到的激活值内存爆炸。于是我们就能增加更多微批量，而这反过来会真正缩小气泡。
+
+从上图也能看出这种配置的复杂之处：前向和反向传播不再按常规顺序执行，而是在多个设备之间并行交错。每个设备都必须独立调度前向与反向传播的切换，无法再由一个简单的中央训练循环统一控制。
+
+这也是实现流水线并行通常需要对训练代码与模型代码进行相当大规模改动的原因之一。
+
+你同样可以在 Picotron 中找到 1F1B 的完整实现：
+
+> 👉 [Picotron 中的 1F1B PP 实现](https://github.com/huggingface/picotron/blob/0035cce0e04afd6192763b11efe50010d8ad0f71/picotron/pipeline_parallel/pipeline_parallel.py#L85-L145)（原文此处为可展开的代码块）
+
+让我们通过集群上的一些基准测试，看看 1F1B 流水线并行调度在实践中的扩展表现：
+
+![不同微批量数量下流水线并行的吞吐量扩展](../webapp/assets/images/pp_1f1b_scaling.png)
+*不同微批量数量下流水线并行的吞吐量扩展表现。*
+
+左图中，当微批量数量等于或小于 PP 度减一（$m = p - 1$）时，可以看到流水线气泡的危害有多大——性能低下，甚至随着 PP 扩大而下滑。右图则显示，使用远多于 PP 度的微批量数（$m = 32 \gg p - 1$）有助于改善低 PP 度时的性能，但在非常大的 PP 度下仍然受限。实践中，我们不可能为了维持 $m \gg p - 1$ 的比例而无限制地增加微批量数量，因为终究会受到目标全局批量大小的限制。当 PP 度不断增加、微批量数已达可能的最大值时，我们最终只能按照 $r_{bubble} = \frac{p - 1}{m}$ 承受更大的气泡。
+
+有趣的是，在微批量数量较少时，从单个节点（$p = 8$）扩展到两个节点（$p = 16$）性能只下降 14%——远优于张量并行，后者在类似的跨节点场景中通常会有约 43% 的性能衰退。这种在碰上低带宽节点间网络时的表现，使流水线并行在跨多节点的分布式训练中格外有吸引力。
+
+虽然 1F1B 显著减少了激活值的内存占用，但从最后这张图可以看出，流水线气泡仍是效率的主要瓶颈。气泡大小依旧正比于流水线阶段数，让宝贵的 GPU 算力闲置。我们能否设计出更聪明的调度，把这些浪费的计算时间降到最低呢？
+
+## 交错阶段（Interleaving Stages）
+
+1F1B 调度降低了内存占用，但没有明显缩小闲置气泡。要进一步优化，还需要采用其他方法。
+
+事实证明，只要我们愿意引入一些额外的通信操作，这是可能的。是时候谈谈**交错阶段（interleaved stages）**了。
+
+到目前为止，我们都采用沿模型深度方向顺序切分的朴素方案，例如把第 1–4 层放在第一张 GPU，第 5–8 层放在第二张 GPU。还可以考虑其他切分方式，例如把奇数层（1、3、5、7）放在第一张 GPU，偶数层（2、4、6、8）放在第二张 GPU。
+
+整体来说，这可以看成一种“环状流水线”（looping pipeline）：微批量在模型的前向传播过程中，会绕着圈子从一张 GPU 移动到下一张。让我们用图来看看它是怎么运行的：
+
+![交错式流水线并行](../webapp/assets/images/pp_1f1b_interleaved.svg)
+*交错式流水线并行的示例：模型的层分散在 4 张 GPU 上。数字仍然对应微批量编号，但为了清楚起见，我们把模型最前面与最后面的层涂上不同颜色，以呈现层在各 GPU 之间的分布方式。*
+
+这种方案会增加通信量，因为同一批计算现在要多次经过每张 GPU，而原先只需经过一次。不过，更细的切分让前向和反向传播可以更紧密地交错，因此每次传播的时间会除以 $v$（$v$ 表示每张 GPU 上的阶段数或模型分块数）：
+
+$$
+\begin{aligned}
+&t_{pb} = \frac{(p-1)*(t_f+t_b)}{v} \\
+&r_{bubble} = \frac{1}{v}\frac{(p-1)*(t_f+t_b)}{m*(t_f+t_b)} = \frac{p-1}{v*m}
+\end{aligned}
+$$
+
+现在既可以通过增加微批量，也可以通过交错阶段来缩小气泡。代价是通信操作的次数也会增加到 $v$ 倍，因此需要在二者之间权衡。下图展示了 $p=8$ 时的多种 PP 配置：$m=1, v=1$ 对应朴素流水线并行，$v=1$ 对应 AFAB 或 1F1B，而 $v \neq 1$ 则表示交错式配置。
+
+> 🔬 原文此处为交互图表（$p=8$ 时不同微批量数 $m$ 与交错阶段数 $v$ 组合下的气泡大小比较），可前往[原网页](https://huggingface.co/spaces/nanotron/ultrascale-playbook)体验；下图为静态版本。
+
+![不同 PP 配置下的气泡大小](../webapp/assets/images/pp_bubblesize.png)
+
+这里的调度也变得更复杂，因为我们必须在特定 GPU 上、特定时刻决定优先处理哪一边：是让较早的微批量优先通过较后面的层——意即尽快关闭前向与反向的循环（所谓“深度优先”（depth-first），即优先让批量尽快离开模型）——还是优先让较晚的微批量通过较前面的层（所谓“广度优先”（breadth-first），即优先把流水线尽量填满）。这个选择在很棒的“Breadth-First Pipeline Parallelism”论文中有详细说明。
+
+现在你已经具备了理解 Llama 3.1 流水线并行做法的所有要素：它采用一前一后（1F1B）搭配交错阶段的配置，且优先序可以在深度优先与广度优先之间调整。
+
+![Llama 3.1 的流水线调度](../webapp/assets/images/pp_llama3.1_schedule.png)
+
+流水线调度的优化还没有结束。近期提出的一些方法可以把**气泡减少到接近零**，DeepSeek V3/R1 就使用了相关技术。下面简要介绍这些调度方法。
+
+## 零气泡（Zero Bubble）与 DualPipe
+
+近期研究提出了更精细的气泡缩减方法，可以接近“零气泡”（zero bubble）。其核心是把相关计算拆得更细，再以更高效的方式交错调度。例如，DeepSeek V3/R1 使用的 DualPipe 就达到了接近零气泡的效果。
+
+> 📝 **注**：DeepSeek V3 技术报告中的终极“炫技”：作者指出他们的配置“实现了近乎为零的 all-to-all 通信开销”。
+
+让我们通过概述 ZeroBubble 这项 DualPipe 的前驱研究，简单看看这是怎么办到的。ZeroBubble 的基本观察是：矩阵乘法的反向传播其实包含两个彼此分离的运算——对输入的反向运算（$B$），以及对权重的反向运算（$W$）：
+
+其中，$B$（对输入的反向传播）的输出是运行下层反向传播所必需的，但 $W$（对权重的反向传播）对反向传播的其余部分并非必要，一般而言只需要在优化器更新步骤之前完成即可。我们可以在下图中看到这一点：
+
+![ZeroBubble 对反向传播的细粒度拆解计算图](../webapp/assets/images/pp_zerobubble_compgraph.png)
+
+这意味着 $W$ 可以灵活安排在同一阶段对应的 $B$ 之后，从而用 $W$ 填补流水线气泡。右上方的 ZB-H2 调度正是利用这种细粒度拆解，在理论上实现了零气泡。
+
+![ZeroBubble 调度比较](../webapp/assets/images/pp_zerobubble_ppschedule.png)
+*上方（ZeroBubble 论文的图 2）：经典的 1F1B 调度，前向与反向传播交错运行，但反向传播仍维持粗粒度的整体。下方两张图（ZeroBubble 论文的图 3）：ZeroBubble 调度的两种变体，把反向运算拆成“B”与“W”两个更细粒度的运算。最后一种名为“ZB-H2”的调度，就是利用这种细粒度拆解实现零气泡的（理论）调度示例。*
+
+DeepSeek 的 DualPipe 随其 V3 技术报告一同发表，将这种拆解式做法进一步延伸到“两条数据流从 PP 维度的两端同时传入”的场景，并将这两条数据流交错调度，把 GPU 的闲置时间压得更低。下方的调度图展示了这种调度，它比先前那些都还要复杂：
+
+![DualPipe 调度](../webapp/assets/images/pp_zerobubble_dualpipe.png)
+
+一般而言，要充分优化这类复杂的调度，需要仔细测量各种细粒度运算的耗时，并求解一个整数线性规划（ILP）问题来最小化最终的气泡时间。关于运行这类调度所用的启发式方法与算法，可参阅 ZeroBubble 论文中的讨论。总之，ZeroBubble 与 DualPipe 的调度过于复杂，我们无法在此提供代码片段，但你应该已经对其中涉及的概念有了大致的认识。
+
+至此，我们完成了对流水线调度和气泡问题的介绍。
+
+接下来介绍最后一种用于高效训练大模型的并行化方法：**专家并行**（expert parallelism）。
+
+</script>
+<script src="../assets/marked.min.js"></script>
+<script src="../assets/katex/katex.min.js"></script>
+<script src="../assets/katex/auto-render.min.js"></script>
+<script src="../assets/widgets/ch05.js"></script>
+<script src="../assets/app.js"></script>
+<script src="../assets/gh-star.js"></script>
+</body>
+</html>
